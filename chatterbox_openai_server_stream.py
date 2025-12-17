@@ -6,14 +6,57 @@ import numpy as np
 import pysbd
 import torch
 from flask import Flask, request, send_file, jsonify, render_template, render_template_string, Response
-from chatterbox.tts import ChatterboxTTS
-from chatterbox.mtl_tts import ChatterboxMultilingualTTS, SUPPORTED_LANGUAGES
+from chatterbox.tts_turbo import ChatterboxTurboTTS
 import torchaudio
+
+# --- START MONKEY PATCH (Fix Float64/Double Errors) ---
+try:
+    import torch
+    import numpy as np
+    from chatterbox.models.s3tokenizer.s3tokenizer import S3Tokenizer
+    from chatterbox.models.voice_encoder.voice_encoder import VoiceEncoder
+
+    print("Applying float32 patches to S3Tokenizer and VoiceEncoder...")
+
+    # 1. Patch S3Tokenizer
+    _original_log_mel = S3Tokenizer.log_mel_spectrogram
+    
+    def patched_log_mel_spectrogram(self, wav):
+        if torch.is_tensor(wav) and wav.dtype == torch.float64:
+            wav = wav.to(torch.float32)
+        return _original_log_mel(self, wav)
+    
+    S3Tokenizer.log_mel_spectrogram = patched_log_mel_spectrogram
+
+    # 2. Patch VoiceEncoder
+    _original_embeds_from_wavs = VoiceEncoder.embeds_from_wavs
+
+    def patched_embeds_from_wavs(self, wavs, *args, **kwargs):
+        # 'wavs' is a list of waveforms. We must ensure all are float32.
+        cleaned_wavs = []
+        for w in wavs:
+            if torch.is_tensor(w) and w.dtype == torch.float64:
+                w = w.to(torch.float32)
+            elif isinstance(w, np.ndarray) and w.dtype == np.float64:
+                w = w.astype(np.float32)
+            cleaned_wavs.append(w)
+        return _original_embeds_from_wavs(self, cleaned_wavs, *args, **kwargs)
+
+    VoiceEncoder.embeds_from_wavs = patched_embeds_from_wavs
+
+    print("Successfully applied float32 patches.")
+
+except ImportError as e:
+    print(f"Warning: Could not apply patches. Error: {e}")
+except Exception as e:
+    print(f"Warning: An error occurred while applying patches: {e}")
+# --- END MONKEY PATCH ---
+
 
 # Set up Flask app
 app = Flask(__name__)
 
-parser = argparse.ArgumentParser(description="OpenAI-compatible TTS server for Chatterbox.")
+parser = argparse.ArgumentParser(description="OpenAI-compatible TTS server for Chatterbox Turbo.")
 
 # Server arguments
 parser.add_argument("--host", type=str, default="0.0.0.0", help="Host for the server.")
@@ -49,20 +92,12 @@ LANGUAGE = args.language_id if args.language_id else "en" # Probably need to che
 
 def load_chatterbox_tts_model(device):
     try:
-        if LANGUAGE == "en":
-            if args.model_path:
-                print(f"Attempting to load model from local path: {args.model_path}")
-                tts_model = ChatterboxTTS.from_local(ckpt_dir=args.model_path, device=device)
-            else:
-                print("Attempting to load model from pretrained Hugging Face hub.")
-                tts_model = ChatterboxTTS.from_pretrained(device=device)
+        if args.model_path:
+            print(f"Attempting to load model from local path: {args.model_path}")
+            tts_model = ChatterboxTurboTTS.from_local(ckpt_dir=args.model_path, device=device)
         else:
-            if args.model_path:
-                print(f"Attempting to load model from local path: {args.model_path}")
-                tts_model = ChatterboxMultilingualTTS.from_local(ckpt_dir=args.model_path, device=device)
-            else:
-                print("Attempting to load model from pretrained Hugging Face hub.")
-                tts_model = ChatterboxMultilingualTTS.from_pretrained(device=device)
+            print("Attempting to load model from pretrained Hugging Face hub.")
+            tts_model = ChatterboxTurboTTS.from_pretrained(device=device)
     except Exception as e:
         print(f"Could not load Chatterbox model. Error: {e}. If loading from a model path, double check the path.")
     print(f"Model loaded successfully on {device}.")
@@ -174,6 +209,7 @@ def openai_tts():
         min_p=args.min_p,
         top_p=args.top_p,
         repetition_penalty=args.repetition_penalty,
+        norm_loudness=True,
     )
     # Add language_id only if not English
     if LANGUAGE != "en":
